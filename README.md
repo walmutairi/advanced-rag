@@ -212,43 +212,85 @@ no-hallucination guarantee, so make it last and deliberately.
 
 ## Architecture
 
-![System architecture — ingest path, query path, storage, guardrails, and Ollama](docs/architecture.svg)
+<p align="center">
+  <img src="docs/architecture.svg" alt="Advanced RAG system architecture diagram" width="900"/>
+</p>
+
+The diagram above shows the full pipeline: three entry points feed a single orchestrator, which runs either the **ingest path** (build the index once) or the **query path** (answer many times). Manual question-bank edits act as guardrails throughout.
+
+### Entry points
+
+| Part | Module | What it does |
+|---|---|---|
+| **Streamlit UI** | [app.py](app.py) | Upload PDFs, watch ingest progress, browse and edit the question bank, and chat with citations. |
+| **HTTP API** | [rag/api.py](rag/api.py) | Headless `/ask` and `/health` endpoints for scripts or other apps on the same machine. |
+| **CLI** | [rag/pipeline.py](rag/pipeline.py) | `ingest`, `ask`, and `stats` commands for terminal-only workflows. |
+
+All three call the same **RAG Pipeline** orchestrator ([rag/pipeline.py](rag/pipeline.py)), which wires together loading, extraction, indexing, retrieval, and answering.
+
+---
 
 ### Ingest path (build once)
 
-| Part | Module | Role |
-|---|---|---|
-| **PDF upload** | `data/uploads` | Source documents land here |
-| **PDF loader** | [rag/pdf_loader.py](rag/pdf_loader.py) | Extract text layer, tables, figure captions |
-| **OCR (Surya)** | [rag/ocr.py](rag/ocr.py) | Re-read scanned or RTL pages; cached under `data/cache/ocr` |
-| **Chunker** | [rag/chunker.py](rag/chunker.py) | Structure-aware chunks with parent–child windows |
-| **QA extractor** | [rag/qa_extractor.py](rag/qa_extractor.py) | Mine the question bank; validate verbatim evidence |
-| **Embed** | [rag/ollama_client.py](rag/ollama_client.py) | `bge-m3` embeddings for Chroma + BM25 hybrid index |
-| **Vector store** | [rag/vectorstore.py](rag/vectorstore.py) | Two Chroma collections (questions + chunks) and BM25 |
-| **Guardrails** | [app.py](app.py) | Edit or add Q/A pairs manually — curated entries steer Tier 1 |
+Turns uploaded PDFs into a searchable question bank plus a chunk index.
+
+| # | Part | Module | What it does |
+|---|---|---|---|
+| 1 | **PDF upload** | `data/uploads` | Raw PDFs are saved here. Re-ingesting the same file is skipped unless you force it. |
+| 2 | **PDF loader** | [rag/pdf_loader.py](rag/pdf_loader.py) | Reads the embedded text layer, pulls out tables and figure captions, and flags pages that need OCR. |
+| 3 | **OCR (Surya)** | [rag/ocr.py](rag/ocr.py) | Re-reads scanned or RTL (Arabic/Hebrew) pages as images. Results are cached under `data/cache/ocr`. |
+| 4 | **Chunker** | [rag/chunker.py](rag/chunker.py) | Splits pages into structure-aware chunks with overlap. Optional parent–child windows give broader context at answer time. |
+| 5 | **QA extractor** | [rag/qa_extractor.py](rag/qa_extractor.py) | An LLM mines questions, answers, evidence quotes, paraphrases, and difficulty labels from each chunk. Pairs without verifiable evidence are dropped. |
+| 6 | **Embed** | [rag/ollama_client.py](rag/ollama_client.py) | `bge-m3` produces 1024-dim embeddings for both questions and chunks. |
+| 7 | **Vector store** | [rag/vectorstore.py](rag/vectorstore.py) | Persists two Chroma collections (question bank + document chunks) and in-memory BM25 indexes for hybrid search. |
+
+**Guardrails (manual Q/A):** From the Streamlit UI you can add or edit question–answer pairs at any time without re-ingesting. These curated entries are indexed like extracted ones and take priority in Tier 1 retrieval — they steer the system toward approved phrasing and grounding.
+
+---
 
 ### Query path (answer many times)
 
-| Part | Module | Role |
-|---|---|---|
-| **Retrieval router** | [rag/retrieval.py](rag/retrieval.py) | Query decomposition, hybrid search, LLM rerank + gate |
-| **Tier 1 — Question bank** | [rag/vectorstore.py](rag/vectorstore.py) | Dense + BM25 over questions and paraphrases (≥ 0.72) |
-| **Tier 2 — Classical RAG** | [rag/vectorstore.py](rag/vectorstore.py) | RRF over document chunks when Tier 1 misses (≥ 0.45) |
-| **Tier 3 — Refuse** | [rag/retrieval.py](rag/retrieval.py) | No retrieval hit → no generation call |
-| **Answerer** | [rag/answerer.py](rag/answerer.py) | Grounded synthesis, citations, groundedness audit |
-| **Ollama** | [rag/ollama_client.py](rag/ollama_client.py) | Local LLM + embeddings (`gemma4:31b`, `bge-m3`) |
+Routes each user question through the bank first, then chunk search, then refusal.
 
-### Shared infrastructure
+| # | Part | Module | What it does |
+|---|---|---|---|
+| 1 | **User query** | — | Natural-language question from the UI, API, or CLI. |
+| 2 | **Retrieval router** | [rag/retrieval.py](rag/retrieval.py) | Decomposes complex queries, runs hybrid dense + BM25 search, reranks candidates with an LLM, and applies a relevance gate. |
+| 3 | **Tier 1 — Question bank** | [rag/vectorstore.py](rag/vectorstore.py) | Matches against extracted and manual questions (and paraphrases). Hit threshold: **≥ 0.72**. Returns pre-grounded answers with evidence. |
+| 4 | **Tier 2 — Classical RAG** | [rag/vectorstore.py](rag/vectorstore.py) | Falls back to reciprocal-rank fusion over document chunks when Tier 1 misses. Hit threshold: **≥ 0.45**. |
+| 5 | **Tier 3 — Refuse** | [rag/retrieval.py](rag/retrieval.py) | If neither tier clears its threshold, the system refuses without calling the LLM — no answer is better than a hallucinated one. |
+| 6 | **Answerer** | [rag/answerer.py](rag/answerer.py) | Synthesises a final response with page-level citations, uncertainty badges, and a post-hoc groundedness audit on Tier 2 answers. |
+
+---
+
+### Local inference (Ollama)
+
+| Part | Module | What it does |
+|---|---|---|
+| **Ollama** | [rag/ollama_client.py](rag/ollama_client.py) | All LLM and embedding calls stay on your machine. Default models: `gemma4:31b` (extract + answer) and `bge-m3` (embeddings). Override with `RAG_EXTRACT_MODEL` / `RAG_ANSWER_MODEL`. |
+
+---
+
+### Hallucination guards and observability
+
+| Guard / tool | Where | What it does |
+|---|---|---|
+| **Evidence at extraction** | [rag/qa_extractor.py](rag/qa_extractor.py) | Every Q/A pair must quote its source verbatim; unverifiable pairs never enter the index. |
+| **Similarity thresholds** | [rag/retrieval.py](rag/retrieval.py) | Below threshold → no retrieval, no generation. |
+| **`INSUFFICIENT_CONTEXT` sentinel** | [rag/answerer.py](rag/answerer.py) | The answering prompt forbids outside knowledge; the model must refuse when sources fall short. |
+| **Groundedness audit** | [rag/answerer.py](rag/answerer.py) | A second LLM pass checks each claim against retrieved context before the answer is shown. |
+| **Manual Q/A guardrails** | [app.py](app.py) | Curated bank entries steer Tier 1 toward trusted answers. |
+| **OCR + extract caches** | `data/cache/` | Speed up re-ingest when document text has not changed. |
+| **Eval harness** | [eval/](eval/) | Route-only and baseline comparisons against naive vector RAG. |
+| **Metrics** | [rag/metrics.py](rag/metrics.py) | Tracks refuse rate and latency over time. |
+
+### Shared configuration
 
 | File | Role |
 |---|---|
-| [config.py](config.py) | Every tunable, env-overridable |
-| [rag/schemas.py](rag/schemas.py) | Dataclass contracts shared by all stages |
-| [rag/pipeline.py](rag/pipeline.py) | Orchestrator façade + CLI |
-| [rag/api.py](rag/api.py) | Headless HTTP `/ask` and `/health` |
-| [app.py](app.py) | Streamlit UI (ingest, browse bank, chat) |
-| [eval/](eval/) | Route-only and baseline eval harness |
-| [rag/metrics.py](rag/metrics.py) | Refuse rate and latency observability |
+| [config.py](config.py) | Every tunable setting, overridable via environment variables |
+| [rag/schemas.py](rag/schemas.py) | Dataclass contracts (`Chunk`, `QAPair`, `AnswerResult`, etc.) shared by all stages |
+| [rag/text_normalize.py](rag/text_normalize.py) | Arabic-aware tokenisation for BM25 and deduplication |
 
 Citations resolve to a document name, a page label, and the verbatim quote the
 claim rests on — every answer is auditable back to the page it came from.
