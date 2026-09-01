@@ -3,6 +3,9 @@
 A fully local RAG system that mines an **advanced question bank** out of your PDFs
 up front, then answers by searching those questions first and falling back to
 classical vector retrieval — refusing outright when neither has the answer.
+You can **edit and add questions** in the bank at any time; those curated entries
+act as **guardrails**, steering answers toward approved phrasing and grounding
+before the system ever reaches for raw chunk retrieval.
 
 Nothing leaves your machine. All inference runs on [Ollama](https://ollama.com).
 
