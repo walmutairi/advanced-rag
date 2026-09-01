@@ -244,7 +244,7 @@ Turns uploaded PDFs into a searchable question bank plus a chunk index.
 | 6 | **Embed** | [rag/ollama_client.py](rag/ollama_client.py) | `bge-m3` produces 1024-dim embeddings for both questions and chunks. |
 | 7 | **Vector store** | [rag/vectorstore.py](rag/vectorstore.py) | Persists two Chroma collections (question bank + document chunks) and in-memory BM25 indexes for hybrid search. |
 
-**Guardrails (manual Q/A):** From the Streamlit UI you can add or edit question–answer pairs at any time without re-ingesting. These curated entries are indexed like extracted ones and take priority in Tier 1 retrieval — they steer the system toward approved phrasing and grounding.
+**Guardrails (manual Q/A):** From the Streamlit UI you can add or edit question–answer pairs at any time without re-ingesting. Thumbs-down on a live answer parks it in the question bank as **Needs review** so you can fix it and approve it into the bank; thumbs-up saves nothing. Approved entries are indexed like extracted ones and take priority in Tier 1 retrieval — they steer the system toward approved phrasing and grounding.
 
 ---
 

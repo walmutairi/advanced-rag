@@ -17,8 +17,10 @@ from pathlib import Path
 import streamlit as st
 
 import config
+from rag import reviews
 from rag.pipeline import IngestCancelled, RAGPipeline
 from rag.schemas import (
+    MANUAL_DOC_ID,
     ROUTE_HYBRID,
     ROUTE_QUESTION_BANK,
     ROUTE_REFUSED,
@@ -648,20 +650,36 @@ def _render_question_bank() -> None:
     its evidence side by side anyway. The real browser lives in the main panel.
     """
     documents = load_documents(st.session_state.corpus_token)
+    pending = reviews.review_count()
     if not documents:
+        if pending:
+            st.caption(f"**{pending}** answer(s) waiting for review.")
+            if st.button(
+                f"Browse question bank ({pending} to review)",
+                use_container_width=True,
+            ):
+                st.session_state.show_questions = True
+                st.rerun()
         return
 
     summary = load_question_bank_summary(st.session_state.corpus_token, None)
-    if summary.get("total", 0) == 0:
+    total = summary.get("total", 0)
+    if total == 0 and pending == 0:
         st.caption("No questions extracted yet.")
         return
-
-    st.caption(
-        f"**{summary['total']}** questions · "
-        f"**{summary.get('type_count', 0)}** types · "
-        f"**{summary.get('hard', 0)}** hard"
-    )
-    if st.button("Browse question bank", use_container_width=True):
+    if total == 0:
+        st.caption(f"**{pending}** answer(s) waiting for review.")
+    else:
+        pending_note = f" · **{pending}** need review" if pending else ""
+        st.caption(
+            f"**{total}** questions · "
+            f"**{summary.get('type_count', 0)}** types · "
+            f"**{summary.get('hard', 0)}** hard{pending_note}"
+        )
+    browse_label = "Browse question bank"
+    if pending:
+        browse_label = f"Browse question bank ({pending} to review)"
+    if st.button(browse_label, use_container_width=True):
         st.session_state.show_questions = True
         st.rerun()
 
@@ -895,6 +913,7 @@ def render_question_bank_page(pipeline: RAGPipeline) -> None:
         st.rerun()
 
     _render_add_question(pipeline, by_name)
+    _render_review_queue(pipeline)
 
     choice = st.selectbox("Document", ["All documents", *by_name], key="qb_doc")
     doc_id = by_name.get(choice)
@@ -902,135 +921,134 @@ def render_question_bank_page(pipeline: RAGPipeline) -> None:
 
     if summary.get("total", 0) == 0:
         st.warning(
-            "No questions here yet. Either extract them by ingesting a PDF, or "
-            "add one by hand above — without a question bank every search falls "
-            "through to plain vector retrieval.",
+            "No extracted questions in this scope yet. Add one by hand above, "
+            "approve a flagged answer, or ingest a PDF — without a question bank "
+            "every search falls through to plain vector retrieval.",
             icon="⚠️",
         )
-        return
+    else:
+        by_type = summary.get("by_type", {})
+        by_level = summary.get("by_difficulty", {})
+        hard = int(summary.get("hard", 0))
 
-    by_type = summary.get("by_type", {})
-    by_level = summary.get("by_difficulty", {})
-    hard = int(summary.get("hard", 0))
-
-    cols = st.columns(4)
-    cols[0].metric("Questions", summary["total"])
-    cols[1].metric("Types covered", f"{summary.get('type_count', 0)}/{len(config.QUESTION_TYPES)}")
-    cols[2].metric("Advanced", by_level.get("advanced", 0))
-    cols[3].metric(
-        "Hard types", hard, help="multi_hop + critical + application"
-    )
-
-    if hard == 0:
-        st.info(
-            "No multi-hop, critical or application questions were extracted. "
-            "The bank will handle lookups but not reasoning-style queries — "
-            "raising `RAG_QA_PER_CHUNK_MAX` and re-ingesting usually helps.",
-            icon="💡",
+        cols = st.columns(4)
+        cols[0].metric("Questions", summary["total"])
+        cols[1].metric(
+            "Types covered", f"{summary.get('type_count', 0)}/{len(config.QUESTION_TYPES)}"
+        )
+        cols[2].metric("Advanced", by_level.get("advanced", 0))
+        cols[3].metric(
+            "Hard types", hard, help="multi_hop + critical + application"
         )
 
-    with st.expander("Distribution", expanded=False):
-        left, right = st.columns(2)
-        left.caption("By type")
-        _bar_list(left, by_type)
-        right.caption("By difficulty")
-        _bar_list(
-            right, {d: by_level.get(d, 0) for d in config.DIFFICULTY_LEVELS}
+        if hard == 0:
+            st.info(
+                "No multi-hop, critical or application questions were extracted. "
+                "The bank will handle lookups but not reasoning-style queries — "
+                "raising `RAG_QA_PER_CHUNK_MAX` and re-ingesting usually helps.",
+                icon="💡",
+            )
+
+        with st.expander("Distribution", expanded=False):
+            left, right = st.columns(2)
+            left.caption("By type")
+            _bar_list(left, by_type)
+            right.caption("By difficulty")
+            _bar_list(
+                right, {d: by_level.get(d, 0) for d in config.DIFFICULTY_LEVELS}
+            )
+
+        st.divider()
+
+        search = st.text_input(
+            "Filter", placeholder="Substring match on question, answer or keyword…"
+        )
+        filters = st.columns(2)
+        picked_types = filters[0].multiselect("Type", sorted(by_type), default=[])
+        picked_levels = filters[1].multiselect(
+            "Difficulty",
+            [d for d in config.DIFFICULTY_LEVELS if by_level.get(d)],
+            default=[],
         )
 
-    st.divider()
-
-    search = st.text_input(
-        "Filter", placeholder="Substring match on question, answer or keyword…"
-    )
-    filters = st.columns(2)
-    picked_types = filters[0].multiselect("Type", sorted(by_type), default=[])
-    picked_levels = filters[1].multiselect(
-        "Difficulty",
-        [d for d in config.DIFFICULTY_LEVELS if by_level.get(d)],
-        default=[],
-    )
-
-    st.session_state.setdefault("qb_page", 0)
-    filter_key = (
-        choice,
-        search.strip().casefold(),
-        tuple(sorted(picked_types)),
-        tuple(sorted(picked_levels)),
-    )
-    if st.session_state.get("qb_filter_key") != filter_key:
-        st.session_state.qb_filter_key = filter_key
-        st.session_state.qb_page = 0
-
-    offset = st.session_state.qb_page * QUESTION_BANK_PAGE_SIZE
-    page = load_question_bank_page(
-        st.session_state.corpus_token,
-        doc_id,
-        search.strip(),
-        tuple(picked_types),
-        tuple(picked_levels),
-        offset,
-        QUESTION_BANK_PAGE_SIZE,
-    )
-    shown = page["pairs"]
-    filtered_total = page["total"]
-
-    top, download = st.columns([3, 1])
-    top.caption(
-        f"Showing {offset + 1}-{offset + len(shown)} of {filtered_total} "
-        f"matching questions ({summary['total']} total in scope)"
-    )
-    if filtered_total:
-        export_pairs = pipeline.export_question_bank(
-            doc_id=doc_id,
-            search=search.strip(),
-            types=picked_types,
-            difficulties=picked_levels,
+        st.session_state.setdefault("qb_page", 0)
+        filter_key = (
+            choice,
+            search.strip().casefold(),
+            tuple(sorted(picked_types)),
+            tuple(sorted(picked_levels)),
         )
-        download.download_button(
-            "Download JSON",
-            data=json.dumps(
-                [_qa_pair_to_dict(pair) for pair in export_pairs],
-                ensure_ascii=False,
-                indent=2,
-            ),
-            file_name="question_bank.json",
-            mime="application/json",
-            use_container_width=True,
-            help="Exports the filtered set, so it doubles as an evaluation dataset.",
-        )
+        if st.session_state.get("qb_filter_key") != filter_key:
+            st.session_state.qb_filter_key = filter_key
+            st.session_state.qb_page = 0
 
-    if filtered_total > QUESTION_BANK_PAGE_SIZE:
-        pages = (filtered_total + QUESTION_BANK_PAGE_SIZE - 1) // QUESTION_BANK_PAGE_SIZE
-        nav = st.columns([1, 2, 1])
-        if nav[0].button(
-            "← Previous",
-            disabled=st.session_state.qb_page <= 0,
-            use_container_width=True,
-        ):
-            st.session_state.qb_page -= 1
-            st.rerun()
-        nav[1].caption(
-            f"Page {st.session_state.qb_page + 1} of {pages}",
+        offset = st.session_state.qb_page * QUESTION_BANK_PAGE_SIZE
+        page = load_question_bank_page(
+            st.session_state.corpus_token,
+            doc_id,
+            search.strip(),
+            tuple(picked_types),
+            tuple(picked_levels),
+            offset,
+            QUESTION_BANK_PAGE_SIZE,
         )
-        if nav[2].button(
-            "Next →",
-            disabled=st.session_state.qb_page >= pages - 1,
-            use_container_width=True,
-        ):
-            st.session_state.qb_page += 1
-            st.rerun()
+        shown = page["pairs"]
+        filtered_total = page["total"]
 
-    for pair in shown:
-        # Keep an entry expanded while it is being edited or its deletion is
-        # awaiting confirmation, so the controls do not vanish under the user.
-        active = st.session_state.get("editing_qa") == pair["qa_id"] or (
-            st.session_state.get("pending_delete") == pair["qa_id"]
+        top, download = st.columns([3, 1])
+        top.caption(
+            f"Showing {offset + 1}-{offset + len(shown)} of {filtered_total} "
+            f"matching questions ({summary['total']} total in scope)"
         )
-        with st.expander(pair["question"], expanded=active):
-            _render_qa_entry(pipeline, pair)
-    if filtered_total == 0:
-        st.caption("No questions match the current filter.")
+        if filtered_total:
+            export_pairs = pipeline.export_question_bank(
+                doc_id=doc_id,
+                search=search.strip(),
+                types=picked_types,
+                difficulties=picked_levels,
+            )
+            download.download_button(
+                "Download JSON",
+                data=json.dumps(
+                    [_qa_pair_to_dict(pair) for pair in export_pairs],
+                    ensure_ascii=False,
+                    indent=2,
+                ),
+                file_name="question_bank.json",
+                mime="application/json",
+                use_container_width=True,
+                help="Exports the filtered set, so it doubles as an evaluation dataset.",
+            )
+
+        if filtered_total > QUESTION_BANK_PAGE_SIZE:
+            pages = (filtered_total + QUESTION_BANK_PAGE_SIZE - 1) // QUESTION_BANK_PAGE_SIZE
+            nav = st.columns([1, 2, 1])
+            if nav[0].button(
+                "← Previous",
+                disabled=st.session_state.qb_page <= 0,
+                use_container_width=True,
+            ):
+                st.session_state.qb_page -= 1
+                st.rerun()
+            nav[1].caption(
+                f"Page {st.session_state.qb_page + 1} of {pages}",
+            )
+            if nav[2].button(
+                "Next →",
+                disabled=st.session_state.qb_page >= pages - 1,
+                use_container_width=True,
+            ):
+                st.session_state.qb_page += 1
+                st.rerun()
+
+        for pair in shown:
+            active = st.session_state.get("editing_qa") == pair["qa_id"] or (
+                st.session_state.get("pending_delete") == pair["qa_id"]
+            )
+            with st.expander(pair["question"], expanded=active):
+                _render_qa_entry(pipeline, pair)
+        if filtered_total == 0:
+            st.caption("No questions match the current filter.")
 
 
 def _render_danger_zone(pipeline: RAGPipeline) -> None:
@@ -1042,8 +1060,10 @@ def _render_danger_zone(pipeline: RAGPipeline) -> None:
         confirmed = st.checkbox("I understand", key="reset_ok")
         if st.button("Reset", disabled=not confirmed, use_container_width=True):
             pipeline.reset()
+            reviews.clear_all_reviews()
             st.session_state.corpus_token += 1
             st.session_state.search_history = []
+            st.session_state.answer_feedback = {}
             # Disarm the confirmation, or the checkbox stays ticked after the
             # reset and one stray click wipes the index again — expensive,
             # since re-ingesting means paying the extraction cost over.
@@ -1057,10 +1077,267 @@ def _render_danger_zone(pipeline: RAGPipeline) -> None:
 # --------------------------------------------------------------------------
 
 
+def _known_doc_ids() -> set[str]:
+    return {doc["doc_id"] for doc in load_documents(st.session_state.corpus_token)}
+
+
+def _resolve_review_provenance(item: dict) -> tuple[str, str, int, int, str]:
+    """Use manual filing when the source document was removed from the index."""
+    doc_id = (item.get("doc_id") or "").strip()
+    doc_name = (item.get("doc_name") or "").strip()
+    page_start = int(item.get("page_start") or 0)
+    page_end = int(item.get("page_end") or 0)
+    section = (item.get("section") or "").strip()
+    if doc_id and doc_id != MANUAL_DOC_ID and doc_id not in _known_doc_ids():
+        doc_id = ""
+        doc_name = ""
+        page_start = 0
+        page_end = 0
+        section = ""
+    return doc_id, doc_name, page_start, page_end, section
+
+
+def _render_review_queue(pipeline: RAGPipeline) -> None:
+    """Thumbs-downed answers waiting to be fixed and approved into the bank."""
+    items = reviews.list_reviews()
+    heading = (
+        f"Needs review ({len(items)})"
+        if items
+        else "Needs review"
+    )
+    with st.expander(heading, expanded=bool(items)):
+        if not items:
+            st.caption(
+                "Thumbs-down an answer on the search page to park it here. "
+                "Thumbs-up does not save anything."
+            )
+            return
+        st.caption(
+            "These answers were flagged as wrong or incomplete. Edit if needed, "
+            "then approve to add them to the question bank as guardrails."
+        )
+        for item in items:
+            _render_review_item(pipeline, item)
+
+
+def _render_review_item(pipeline: RAGPipeline, item: dict) -> None:
+    review_id = item["review_id"]
+    title = item.get("question") or item.get("query") or review_id
+    with st.container(border=True):
+        st.markdown(f"**{_esc(title)}**")
+        route = (item.get("route") or "").replace("_", " ")
+        if route:
+            st.caption(f"Flagged from {route}")
+        doc_id = (item.get("doc_id") or "").strip()
+        if (
+            doc_id
+            and doc_id != MANUAL_DOC_ID
+            and doc_id not in _known_doc_ids()
+        ):
+            st.warning(
+                "The source document is no longer in the index. Approving will "
+                "file this as a manual question-bank entry.",
+                icon="⚠️",
+            )
+        if item.get("source_qa_id"):
+            st.caption(
+                f"Will update existing bank entry `{item['source_qa_id']}` on approve."
+            )
+        prefill = {
+            "question": item.get("question") or item.get("query", ""),
+            "answer": item.get("answer", ""),
+            "type": item.get("question_type"),
+            "difficulty": item.get("difficulty"),
+            "keywords": item.get("keywords") or [],
+            "paraphrases": item.get("paraphrases") or [],
+            "evidence": item.get("evidence") or [],
+        }
+        values = _qa_review_form(f"rev_{review_id}", prefill)
+        if values is None:
+            return
+        action = values.pop("_action")
+        if action == "discard":
+            reviews.discard_review(review_id)
+            st.toast("Review discarded", icon="🗑️")
+            st.rerun()
+        if action == "draft":
+            reviews.update_review(review_id, values)
+            st.toast("Draft saved — still waiting for approval", icon="📝")
+            st.rerun()
+        if action == "approve":
+            doc_id, doc_name, page_start, page_end, section = _resolve_review_provenance(
+                item
+            )
+            source_qa_id = (item.get("source_qa_id") or "").strip() or None
+            try:
+                with st.spinner("Approving into the question bank…"):
+                    pipeline.upsert_qa_pair(
+                        qa_id=source_qa_id,
+                        doc_id=doc_id,
+                        doc_name=doc_name,
+                        page_start=page_start,
+                        page_end=page_end,
+                        section=section,
+                        **values,
+                    )
+            except ValueError as exc:
+                st.error(str(exc))
+                return
+            reviews.discard_review(review_id)
+            _after_qa_mutation("Approved into the question bank", "✅")
+
+
+def _qa_review_form(key_prefix: str, prefill: dict) -> dict | None:
+    """Same fields as the bank editor, plus draft / approve / discard."""
+    p = prefill
+    with st.form(key=f"{key_prefix}_form"):
+        question = st.text_area(
+            "Question", value=p.get("question", ""), key=f"{key_prefix}_q"
+        )
+        answer = st.text_area(
+            "Answer", value=p.get("answer", ""), key=f"{key_prefix}_a"
+        )
+        left, right = st.columns(2)
+        qtype = left.selectbox(
+            "Type",
+            config.QUESTION_TYPES,
+            index=_option_index(config.QUESTION_TYPES, p.get("type")),
+            key=f"{key_prefix}_t",
+        )
+        level = right.selectbox(
+            "Difficulty",
+            config.DIFFICULTY_LEVELS,
+            index=_option_index(config.DIFFICULTY_LEVELS, p.get("difficulty")),
+            key=f"{key_prefix}_d",
+        )
+        keywords = st.text_input(
+            "Keywords (comma-separated)",
+            value=", ".join(p.get("keywords", [])),
+            key=f"{key_prefix}_k",
+        )
+        paraphrases = st.text_area(
+            "Paraphrases (one per line)",
+            value="\n".join(p.get("paraphrases", [])),
+            key=f"{key_prefix}_p",
+        )
+        evidence = st.text_area(
+            "Evidence quotes (one per line)",
+            value="\n".join(p.get("evidence", [])),
+            key=f"{key_prefix}_e",
+        )
+        approve_col, draft_col, discard_col = st.columns(3)
+        approved = approve_col.form_submit_button(
+            "Approve into bank", type="primary", use_container_width=True
+        )
+        drafted = draft_col.form_submit_button(
+            "Save draft", use_container_width=True
+        )
+        discarded = discard_col.form_submit_button(
+            "Discard", use_container_width=True
+        )
+
+    if not (approved or drafted or discarded):
+        return None
+    if discarded:
+        return {"_action": "discard"}
+    payload = {
+        "question": question,
+        "answer": answer,
+        "question_type": qtype,
+        "difficulty": level,
+        "keywords": [k.strip() for k in keywords.split(",") if k.strip()],
+        "paraphrases": [ln.strip() for ln in paraphrases.splitlines() if ln.strip()],
+        "evidence": [ln.strip() for ln in evidence.splitlines() if ln.strip()],
+        "_action": "approve" if approved else "draft",
+    }
+    return payload
+
+
+def _render_answer_feedback(result: AnswerResult, feedback_key: str) -> None:
+    """Thumbs-down parks the answer for review; thumbs-up stores nothing."""
+    st.session_state.setdefault("answer_feedback", {})
+    voted = st.session_state.answer_feedback.get(result.query)
+    already = reviews.find_review_for_query(result.query)
+    refuse_confirm_key = f"refuse_down_{feedback_key}"
+
+    if already is not None:
+        st.info(
+            "This answer is in the question bank **Needs review** queue. "
+            "Open the question bank to fix it and approve it.",
+            icon="📝",
+        )
+        return
+    if voted == "up":
+        st.caption("Marked as good — nothing was saved.")
+        return
+
+    if (
+        not result.answered
+        and st.session_state.get(refuse_confirm_key) == result.query
+    ):
+        st.warning(
+            "This answer was **refused** — there is no grounded response to save. "
+            "Queue it only if you want to add a corrected question and answer manually.",
+            icon="⚠️",
+        )
+        yes_col, no_col = st.columns(2)
+        if yes_col.button(
+            "Yes, queue for review",
+            key=f"confirm_down_{feedback_key}",
+            use_container_width=True,
+        ):
+            try:
+                reviews.flag_answer(result)
+            except ValueError as exc:
+                st.error(str(exc))
+                return
+            st.session_state.answer_feedback[result.query] = "down"
+            st.session_state.pop(refuse_confirm_key, None)
+            st.toast("Sent to the question bank for review", icon="👎")
+            st.rerun()
+        if no_col.button(
+            "Cancel",
+            key=f"cancel_down_{feedback_key}",
+            use_container_width=True,
+        ):
+            st.session_state.pop(refuse_confirm_key, None)
+            st.rerun()
+        return
+
+    up_col, down_col = st.columns(2)
+    if up_col.button(
+        "👍 Looks good",
+        key=f"up_{feedback_key}",
+        use_container_width=True,
+        help="No result is stored. The question bank is unchanged.",
+    ):
+        st.session_state.answer_feedback[result.query] = "up"
+        st.toast("Thanks — nothing saved", icon="👍")
+        st.rerun()
+    if down_col.button(
+        "👎 Needs review",
+        key=f"down_{feedback_key}",
+        use_container_width=True,
+        help="Send this Q/A to the question bank so you can fix and approve it.",
+    ):
+        if not result.answered:
+            st.session_state[refuse_confirm_key] = result.query
+            st.rerun()
+        try:
+            reviews.flag_answer(result)
+        except ValueError as exc:
+            st.error(str(exc))
+            return
+        st.session_state.answer_feedback[result.query] = "down"
+        st.toast("Sent to the question bank for review", icon="👎")
+        st.rerun()
+
+
 def render_answer(
     result: AnswerResult,
     *,
     show_diagnostics: bool = True,
+    feedback_key: str = "answer",
 ) -> None:
     icon, label, accent = ROUTE_STYLE.get(result.route, ("⚪", result.route, "128,128,128"))
 
@@ -1089,6 +1366,7 @@ def render_answer(
 
     body_class = "rag-refusal" if not result.answered else "rag-answer"
     st.markdown(_html_div(body_class, result.answer), unsafe_allow_html=True)
+    _render_answer_feedback(result, feedback_key)
 
     near_misses = getattr(result, "near_misses", None) or []
     if not result.answered and near_misses:
@@ -1184,6 +1462,7 @@ def main() -> None:
     st.session_state.setdefault("editing_qa", None)
     st.session_state.setdefault("pending_delete", None)
     st.session_state.setdefault("qb_page", 0)
+    st.session_state.setdefault("answer_feedback", {})
 
     pipeline = get_pipeline()
 
@@ -1221,22 +1500,25 @@ def main() -> None:
 
     render_sidebar(pipeline)
 
+    if st.session_state.show_questions:
+        render_question_bank_page(pipeline)
+        return
+
     if not load_documents(st.session_state.corpus_token):
         st.info("Upload a PDF in the sidebar to get started.", icon="👈")
         return
 
     n_questions = load_stats(st.session_state.corpus_token).get("n_questions", 0)
+    n_reviews = reviews.review_count()
+    review_suffix = f" · {n_reviews} to review" if n_reviews else ""
     if st.button(
-        f"📋 Show extracted questions ({n_questions})",
+        f"📋 Show extracted questions ({n_questions}{review_suffix})",
         use_container_width=True,
-        help="Browse everything mined from your PDFs, with evidence and citations.",
+        help="Browse everything mined from your PDFs, with evidence and citations. "
+        "Thumbs-downed answers wait here until you fix and approve them.",
     ):
         st.session_state.show_questions = True
         st.rerun()
-
-    if st.session_state.show_questions:
-        render_question_bank_page(pipeline)
-        return
 
     with st.form("search", clear_on_submit=False):
         query = st.text_input(
@@ -1262,7 +1544,11 @@ def main() -> None:
         st.caption("Recent searches")
         for i, past in enumerate(st.session_state.search_history):
             with st.expander(past.query, expanded=(i == 0)):
-                render_answer(past, show_diagnostics=(i == 0))
+                render_answer(
+                    past,
+                    show_diagnostics=(i == 0),
+                    feedback_key=f"hist_{i}",
+                )
                 if i > 0 and st.button("Search again", key=f"requery_{i}"):
                     st.session_state.pending_query = past.query
                     st.rerun()
