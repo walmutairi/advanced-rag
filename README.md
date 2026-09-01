@@ -212,19 +212,43 @@ no-hallucination guarantee, so make it last and deliberately.
 
 ## Architecture
 
+![System architecture — ingest path, query path, storage, guardrails, and Ollama](docs/architecture.svg)
+
+### Ingest path (build once)
+
+| Part | Module | Role |
+|---|---|---|
+| **PDF upload** | `data/uploads` | Source documents land here |
+| **PDF loader** | [rag/pdf_loader.py](rag/pdf_loader.py) | Extract text layer, tables, figure captions |
+| **OCR (Surya)** | [rag/ocr.py](rag/ocr.py) | Re-read scanned or RTL pages; cached under `data/cache/ocr` |
+| **Chunker** | [rag/chunker.py](rag/chunker.py) | Structure-aware chunks with parent–child windows |
+| **QA extractor** | [rag/qa_extractor.py](rag/qa_extractor.py) | Mine the question bank; validate verbatim evidence |
+| **Embed** | [rag/ollama_client.py](rag/ollama_client.py) | `bge-m3` embeddings for Chroma + BM25 hybrid index |
+| **Vector store** | [rag/vectorstore.py](rag/vectorstore.py) | Two Chroma collections (questions + chunks) and BM25 |
+| **Guardrails** | [app.py](app.py) | Edit or add Q/A pairs manually — curated entries steer Tier 1 |
+
+### Query path (answer many times)
+
+| Part | Module | Role |
+|---|---|---|
+| **Retrieval router** | [rag/retrieval.py](rag/retrieval.py) | Query decomposition, hybrid search, LLM rerank + gate |
+| **Tier 1 — Question bank** | [rag/vectorstore.py](rag/vectorstore.py) | Dense + BM25 over questions and paraphrases (≥ 0.72) |
+| **Tier 2 — Classical RAG** | [rag/vectorstore.py](rag/vectorstore.py) | RRF over document chunks when Tier 1 misses (≥ 0.45) |
+| **Tier 3 — Refuse** | [rag/retrieval.py](rag/retrieval.py) | No retrieval hit → no generation call |
+| **Answerer** | [rag/answerer.py](rag/answerer.py) | Grounded synthesis, citations, groundedness audit |
+| **Ollama** | [rag/ollama_client.py](rag/ollama_client.py) | Local LLM + embeddings (`gemma4:31b`, `bge-m3`) |
+
+### Shared infrastructure
+
 | File | Role |
 |---|---|
 | [config.py](config.py) | Every tunable, env-overridable |
 | [rag/schemas.py](rag/schemas.py) | Dataclass contracts shared by all stages |
-| [rag/ollama_client.py](rag/ollama_client.py) | Chat, schema-constrained JSON, normalised embeddings |
-| [rag/pdf_loader.py](rag/pdf_loader.py) | PDF → clean page-attributed text |
-| [rag/chunker.py](rag/chunker.py) | Structure-aware, page-tracking chunking |
-| [rag/qa_extractor.py](rag/qa_extractor.py) | The question bank miner + evidence validation |
-| [rag/vectorstore.py](rag/vectorstore.py) | Two Chroma collections, hybrid dense+BM25 |
-| [rag/retrieval.py](rag/retrieval.py) | The tiered router |
-| [rag/answerer.py](rag/answerer.py) | Grounded synthesis, citations, groundedness check |
-| [rag/pipeline.py](rag/pipeline.py) | Façade + CLI |
-| [app.py](app.py) | Streamlit UI |
+| [rag/pipeline.py](rag/pipeline.py) | Orchestrator façade + CLI |
+| [rag/api.py](rag/api.py) | Headless HTTP `/ask` and `/health` |
+| [app.py](app.py) | Streamlit UI (ingest, browse bank, chat) |
+| [eval/](eval/) | Route-only and baseline eval harness |
+| [rag/metrics.py](rag/metrics.py) | Refuse rate and latency observability |
 
 Citations resolve to a document name, a page label, and the verbatim quote the
 claim rests on — every answer is auditable back to the page it came from.
