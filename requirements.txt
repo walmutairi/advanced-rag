@@ -1,0 +1,24 @@
+streamlit==1.41.1
+chromadb==0.5.23
+pymupdf==1.25.1
+requests==2.32.3
+pydantic==2.10.4
+numpy==1.26.4
+rank-bm25==0.2.2
+
+# OCR. Pinned to 0.17.x for its v1 predictor API (FoundationPredictor +
+# RecognitionPredictor + DetectionPredictor). 0.20+ replaced that with a
+# client/server VLM that needs an external llama-server binary, which this
+# app has no way to ship or supervise.
+surya-ocr==0.17.1
+
+# The <5 bound is load-bearing, not caution: transformers 5.x breaks
+# surya 0.17.1 with "SuryaDecoderConfig object has no attribute pad_token_id".
+# Do not relax it without also moving off surya 0.17.
+transformers>=4.56.1,<5
+
+# Known and deliberate: chromadb 0.5.23 declares tokenizers<=0.20.3 while surya
+# pulls 0.22.x, so pip reports a conflict. Chroma is only ever given
+# pre-computed embeddings here and never loads its default embedding function,
+# which is the sole consumer of tokenizers. Do not "fix" this by downgrading
+# tokenizers — that breaks OCR to satisfy a code path we never execute.

@@ -1,0 +1,10 @@
+.venv/
+__pycache__/
+*.pyc
+
+# Local runtime data (indexes, uploads, OCR/extract caches, metrics)
+data/*
+!data/.gitkeep
+
+.DS_Store
+.streamlit/secrets.toml

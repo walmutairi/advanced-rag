@@ -1,0 +1,16 @@
+[server]
+# Streamlit's watcher walks every module in sys.modules to detect edits.
+# torch.classes has a custom __path__ that raises when introspected, printing
+# "Tried to instantiate class '__path__._path'" on startup. Both "watchdog"
+# and "poll" perform that walk, so only "none" actually suppresses it.
+#
+# The cost is no hot reload: after editing a .py you must restart the app.
+# That is the right trade here anyway — a reload would re-import torch and
+# surya and re-load the OCR models, which takes longer than a clean restart.
+fileWatcherType = "none"
+
+[browser]
+gatherUsageStats = false
+
+[logger]
+level = "info"
