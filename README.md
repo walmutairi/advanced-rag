@@ -294,3 +294,9 @@ Routes each user question through the bank first, then chunk search, then refusa
 
 Citations resolve to a document name, a page label, and the verbatim quote the
 claim rests on — every answer is auditable back to the page it came from.
+
+---
+
+## License
+
+This project is licensed under the [MIT License](LICENSE).
